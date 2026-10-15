@@ -49,7 +49,7 @@ use crate::search::{
 /// The path to the daemon's socket.
 ///
 /// If the daemon is running and has recorded its socket path in the pidfile, this function returns
-/// that. Otherwise, this function returns [`settings.daemon.existing_socket_path()`][0].
+/// that. Otherwise, this function returns [`daemon.existing_socket_path()`][0].
 ///
 /// As an exception, if [`systemd_socket`][1] is true, the pidfile isn't consulted, as the socket
 /// path comes from systemd directly through a file descriptor.
@@ -58,18 +58,55 @@ use crate::search::{
 /// [1]: atuin_client::settings::Daemon::systemd_socket
 #[cfg(unix)]
 #[must_use]
-pub fn socket_path(settings: &atuin_client::settings::Settings) -> PathBuf {
-    (!settings.daemon.systemd_socket)
+pub fn socket_path(daemon: &atuin_client::settings::Daemon) -> PathBuf {
+    (!daemon.systemd_socket)
         .then(|| {
-            crate::pidfile::PidfileInfo::read(settings.daemon.pidfile_path.as_ref())
+            crate::pidfile::PidfileInfo::read(daemon.pidfile_path.as_ref())
                 .and_then(|info| info.socket_path)
         })
         .flatten()
-        .unwrap_or_else(|| settings.daemon.existing_socket_path().into_owned())
+        .unwrap_or_else(|| daemon.existing_socket_path().into_owned())
 }
 
 pub struct HistoryClient {
     client: HistoryServiceClient<Channel>,
+}
+
+/// Where the daemon listens for clients.
+#[derive(Clone, Debug, PartialEq, Eq, derive_more::Display, derive_more::From)]
+pub enum DaemonAddress {
+    #[cfg(unix)]
+    #[display("{}", _0.display())]
+    Socket(PathBuf),
+    /// TCP on `127.0.0.1`, at this port.
+    #[cfg(not(unix))]
+    #[display("127.0.0.1:{_0}")]
+    Tcp(u64),
+}
+
+impl DaemonAddress {
+    /// Where the running daemon recorded in its pidfile that it listens, or else where `daemon`
+    /// configures it to.
+    #[must_use]
+    pub fn of(daemon: &atuin_client::settings::Daemon) -> Self {
+        #[cfg(unix)]
+        {
+            Self::Socket(socket_path(daemon))
+        }
+        #[cfg(not(unix))]
+        {
+            Self::Tcp(daemon.tcp_port)
+        }
+    }
+}
+
+/// Errors from connecting to the daemon.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to connect to local atuin daemon at {address}. Is it running?")]
+pub struct ConnectError {
+    address: DaemonAddress,
+    #[source]
+    source: tonic::transport::Error,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,63 +139,40 @@ pub fn classify_error(error: &eyre::Report) -> DaemonClientErrorKind {
 
 // Wrap the grpc client
 impl HistoryClient {
-    #[cfg(unix)]
-    pub async fn new(path: PathBuf) -> Result<Self> {
-        use eyre::Context;
-
-        let log_path = path.clone();
-        let channel =
+    pub async fn new(address: impl Into<DaemonAddress>) -> Result<Self, ConnectError> {
+        let address = address.into();
+        let connector_address = address.clone();
+        let channel = async {
             Endpoint::try_from("http://atuin_local_daemon:0")?
                 .connect_with_connector(service_fn(move |_: Uri| {
-                    let path = path.clone();
+                    let address = connector_address.clone();
 
                     async move {
-                        Ok::<_, std::io::Error>(TokioIo::new(UnixStream::connect(path).await?))
+                        match address {
+                            #[cfg(unix)]
+                            DaemonAddress::Socket(socket) => {
+                                UnixStream::connect(socket).await.map(TokioIo::new)
+                            }
+                            #[cfg(not(unix))]
+                            DaemonAddress::Tcp(port) => {
+                                TcpStream::connect(format!("127.0.0.1:{port}"))
+                                    .await
+                                    .map(TokioIo::new)
+                            }
+                        }
                     }
                 }))
                 .await
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to connect to local atuin daemon at {}. Is it running?",
-                        log_path.display()
-                    )
-                })?;
+        };
+        let channel = channel.await.map_err(|source| ConnectError { address, source })?;
 
         let client = HistoryServiceClient::new(channel);
 
         Ok(Self { client })
     }
 
-    #[cfg(not(unix))]
-    pub async fn new(port: u64) -> Result<Self> {
-        let channel = Endpoint::try_from("http://atuin_local_daemon:0")?
-            .connect_with_connector(service_fn(move |_: Uri| {
-                let url = format!("127.0.0.1:{port}");
-
-                async move {
-                    Ok::<_, std::io::Error>(TokioIo::new(TcpStream::connect(url.clone()).await?))
-                }
-            }))
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "failed to connect to local atuin daemon at 127.0.0.1:{port}. Is it running?"
-                )
-            })?;
-
-        let client = HistoryServiceClient::new(channel);
-
-        Ok(HistoryClient { client })
-    }
-
-    #[cfg(unix)]
     pub async fn from_settings(settings: &Settings) -> Result<Self> {
-        Self::new(socket_path(settings)).await
-    }
-
-    #[cfg(not(unix))]
-    pub async fn from_settings(settings: &Settings) -> Result<Self> {
-        Self::new(settings.daemon.tcp_port).await
+        Ok(Self::new(DaemonAddress::of(&settings.daemon)).await?)
     }
 
     pub async fn start_history(&mut self, h: History) -> Result<StartHistoryReply> {
@@ -236,7 +250,7 @@ impl HistoryClient {
         Ok(self.client.compact_store(CompactStoreRequest {}).await?.into_inner())
     }
 
-    pub async fn status(&mut self) -> Result<StatusReply> {
+    pub async fn status(&mut self) -> Result<StatusReply, tonic::Status> {
         Ok(self.client.status(StatusRequest {}).await?.into_inner())
     }
 
@@ -244,7 +258,7 @@ impl HistoryClient {
         Ok(self.client.tail_history(TailHistoryRequest {}).await?.into_inner())
     }
 
-    pub async fn shutdown(&mut self) -> Result<bool> {
+    pub async fn shutdown(&mut self) -> Result<bool, tonic::Status> {
         let resp = self.client.shutdown(ShutdownRequest {}).await?.into_inner();
         Ok(resp.accepted)
     }
@@ -374,7 +388,7 @@ impl SearchClient {
 
     #[cfg(unix)]
     pub async fn from_settings(settings: &Settings) -> Result<Self> {
-        Self::new(socket_path(settings)).await
+        Self::new(socket_path(&settings.daemon)).await
     }
 
     #[cfg(not(unix))]
@@ -530,7 +544,7 @@ impl AiClient {
 
     #[cfg(unix)]
     pub async fn from_settings(settings: &Settings) -> Result<Self> {
-        Self::new(socket_path(settings)).await
+        Self::new(socket_path(&settings.daemon)).await
     }
 
     #[cfg(not(unix))]
@@ -699,7 +713,7 @@ mod tests {
         drop(PidfileGuard::acquire(&old.daemon).unwrap());
 
         let new = settings(&pidfile, &dir.path().join("new.sock"), client_systemd_socket);
-        assert_eq!(socket_path(&new), dir.path().join(expected));
+        assert_eq!(socket_path(&new.daemon), dir.path().join(expected));
     }
 
     #[rstest]
@@ -710,7 +724,7 @@ mod tests {
             &dir.path().join("a.sock"),
             systemd_socket,
         );
-        assert_eq!(socket_path(&settings), dir.path().join("a.sock"));
+        assert_eq!(socket_path(&settings.daemon), dir.path().join("a.sock"));
     }
 }
 

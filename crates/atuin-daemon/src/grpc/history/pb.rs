@@ -476,6 +476,7 @@ invalid_argument_errors!(
 );
 
 versioned_messages!(
+    StatusReply,
     StartHistoryReply,
     EndHistoryReply,
     CancelHistoryReply,
