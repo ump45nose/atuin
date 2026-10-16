@@ -632,7 +632,7 @@ fn update_config<'a, C>(config: &str, changes: C) -> Result<String>
 where
     // These bounds are ugly, but they allow passing arrays or `Vec`s.
     C: IntoIterator<Item = (&'a str, Value)>,
-    for<'c> &'c C: IntoIterator<Item = &'c C::Item>,
+    for<'c> &'c C: IntoIterator<Item = &'c (&'a str, Value)>,
 {
     let mut config = config;
     let mut owned_config;
