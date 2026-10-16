@@ -926,17 +926,19 @@ mod tests {
             .get_updated_config(config)
             .expect("the update should be accepted");
 
-        assert_eq!(
-            updated,
-            config.replacen("# search_mode = \"fuzzy\"", "search_mode = \"daemon-fuzzy\"", 1)
-        );
+        let expected = config
+            .replacen("# search_mode = \"fuzzy\"", "search_mode = \"daemon-fuzzy\"", 1)
+            .replace("\r\n", "\n"); // toml_edit always writes LF line endings
+        assert_eq!(updated, expected);
     }
 
     /// A new table goes after every comment in the file, which all document existing tables.
     #[rstest]
     fn set_a_key_in_a_new_table_in_the_default_config() {
         let config = Settings::example_config();
-        assert_eq!(set(config, "a.b", Value::from(1)), format!("{config}\n[a]\nb = 1\n"));
+        // toml_edit always writes LF line endings.
+        let expected = format!("{config}\n[a]\nb = 1\n").replace("\r\n", "\n");
+        assert_eq!(set(config, "a.b", Value::from(1)), expected);
     }
 
     #[rstest]
