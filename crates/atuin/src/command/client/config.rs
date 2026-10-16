@@ -630,14 +630,16 @@ fn detect_existing_type(doc: &DocumentMut, key: &str) -> Option<ValueType> {
 /// for more information.
 fn update_config<'a, C>(config: &str, changes: C) -> Result<String>
 where
-    // These bounds are ugly, but they allow passing arrays or `Vec`s.
-    C: IntoIterator<Item = (&'a str, Value)>,
-    for<'c> &'c C: IntoIterator<Item = &'c (&'a str, Value)>,
+    // These bounds allow passing arrays or `Vec`s. Don't try changing the `AsRef`-slice bound to
+    // `for<'c> &'c C: IntoIterator<Item = &'c C::Item>` for more flexibility: it causes compilation
+    // to fail on macOS due to a recursive impl from the `objc2` crate. See
+    // <https://github.com/rust-lang/rust/issues/136856> for more info.
+    C: IntoIterator<Item = (&'a str, Value)> + AsRef<[C::Item]>,
 {
     let mut config = config;
     let mut owned_config;
 
-    for (key, _) in &changes {
+    for (key, _) in changes.as_ref() {
         let path = TomlPath::parse_dotted_simple(key);
         if let Some(new_config) = enable_example(config, path) {
             owned_config = new_config;
